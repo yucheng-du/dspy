@@ -10,6 +10,7 @@ Reference: "Recursive Language Models" (Zhang, Kraska, Khattab, 2025)
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextvars
 import functools
@@ -19,8 +20,8 @@ import logging
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Iterator
 
 import pydantic
 
@@ -145,6 +146,33 @@ def _strip_code_fences(code: str) -> str:
         return remainder.strip()
 
     return remainder[:block_end].strip()
+
+
+def _interpreter_tool_signature(tool: Tool) -> inspect.Signature:
+    """Return the signature sandboxed code calls ``tool`` with.
+
+    A wrapper that forwards ``*args``/``**kwargs`` (e.g. an MCP tool) declares its parameters only in
+    ``tool.args``. Those are exposed instead, required unless they have a default, as in
+    ``Tool.format_as_litellm_function_call``.
+    """
+    signature = inspect.signature(tool.func)
+    variadic = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    if tool.args is None or not any(param.kind in variadic for param in signature.parameters.values()):
+        return signature
+
+    try:
+        parameters = [
+            inspect.Parameter(
+                name, inspect.Parameter.POSITIONAL_OR_KEYWORD, default=schema.get("default", inspect.Parameter.empty)
+            )
+            for name, schema in tool.args.items()
+        ]
+    except ValueError:
+        # An argument name that is not a Python identifier cannot appear in a signature.
+        return signature
+    # Python requires parameters with defaults to follow those without; the sort is stable.
+    parameters.sort(key=lambda param: param.default is not inspect.Parameter.empty)
+    return inspect.Signature(parameters)
 
 
 @experimental
@@ -602,24 +630,37 @@ class RLM(Module):
     # CodeInterpreter Lifecycle
     # =========================================================================
 
-    def _make_interpreter_tool(self, tool: Tool) -> Callable:
-        """Preserve function metadata while routing execution through Tool."""
+    def _make_interpreter_tool(self, tool: Tool, loop: asyncio.AbstractEventLoop | None = None) -> Callable:
+        """Preserve function metadata while routing execution through Tool.
+
+        With ``loop``, async tools run on that event loop and the returned callable blocks until they finish;
+        it must then be called off the loop's thread. Clients such as MCP sessions are bound to the loop
+        that created them, so their tools cannot run on a fresh one.
+        """
         if inspect.iscoroutinefunction(tool.func) or inspect.iscoroutinefunction(getattr(tool.func, "__call__", None)):
-            async def invoke(**kwargs):
-                return await tool.acall(**kwargs)
+            if loop is not None:
+                def invoke(**kwargs):
+                    return asyncio.run_coroutine_threadsafe(tool.acall(**kwargs), loop).result()
+            else:
+                async def invoke(**kwargs):
+                    return await tool.acall(**kwargs)
         else:
             def invoke(**kwargs):
                 return tool(**kwargs)
 
         functools.update_wrapper(invoke, tool.func)
-        invoke.__signature__ = inspect.signature(tool.func)
+        invoke.__signature__ = _interpreter_tool_signature(tool)
         return invoke
 
-    def _prepare_execution_tools(self, budget: _LLMCallBudget | None = None) -> dict[str, Callable]:
+    def _prepare_execution_tools(
+        self, budget: _LLMCallBudget | None = None, loop: asyncio.AbstractEventLoop | None = None
+    ) -> dict[str, Callable]:
         """Create the LLM tools on ``budget`` (fresh by default) and merge with user-provided tools."""
         budget = budget if budget is not None else _LLMCallBudget(self.max_llm_calls)
         execution_tools = self._make_llm_tools(budget)
-        execution_tools.update({name: self._make_interpreter_tool(tool) for name, tool in self._user_tools.items()})
+        execution_tools.update(
+            {name: self._make_interpreter_tool(tool, loop) for name, tool in self._user_tools.items()}
+        )
         return execution_tools
 
     def _inject_execution_context(self, interpreter: CodeInterpreter, execution_tools: dict[str, Callable]) -> None:
@@ -651,6 +692,23 @@ class RLM(Module):
             yield interpreter
         finally:
             interpreter.shutdown()
+
+    @asynccontextmanager
+    async def _ainterpreter_context(
+        self,
+        execution_tools: dict[str, Callable],
+        factory: Callable[[], CodeInterpreter],
+        run_in_interpreter_thread: Callable[..., Awaitable[Any]],
+    ) -> AsyncIterator[CodeInterpreter]:
+        """Async version: shutdown runs on the interpreter thread, after any in-flight execution."""
+        _validate_interpreter_factory(factory)
+        interpreter = factory()
+        _validate_interpreter(interpreter)
+        try:
+            self._inject_execution_context(interpreter, execution_tools)
+            yield interpreter
+        finally:
+            await run_in_interpreter_thread(interpreter.shutdown)
 
     # =========================================================================
     # Execution Core
@@ -895,6 +953,7 @@ class RLM(Module):
         output_field_names: list[str],
         interpreter_factory: Callable[[], CodeInterpreter],
         sub_agent_rules: str,
+        run_in_interpreter_thread: Callable[..., Awaitable[Any]],
     ) -> Prediction | REPLHistory:
         """Async version: Execute one iteration."""
         variables_info = [variable.format() for variable in variables]
@@ -916,7 +975,7 @@ class RLM(Module):
             code = pred.code
             result = f"[Error] {format_error_for_lm(e)}"
             return self._process_execution_result(pred, code, result, history, output_field_names)
-        result = self._execute_code(repl, code, input_args)
+        result = await run_in_interpreter_thread(self._execute_code, repl, code, input_args)
         return self._process_execution_result(pred, code, result, history, output_field_names)
 
     async def aforward(self, *, interpreter_factory: Callable[[], CodeInterpreter] | None = None, **input_args) -> Prediction:
@@ -942,22 +1001,34 @@ class RLM(Module):
 
         output_field_names = list(self.signature.output_fields.keys())
         budget = _LLMCallBudget(self.max_llm_calls)
-        execution_tools = self._prepare_execution_tools(budget)
+        loop = asyncio.get_running_loop()
+        execution_tools = self._prepare_execution_tools(budget, loop)
         variables = self._build_variables(**input_args)
 
-        with self._interpreter_context(execution_tools, interpreter_factory) as repl:
-            sub_agent_rules = self._setup_facade(repl, budget, interpreter_factory)
-            regular_args = self._prepare_serializable_vars(input_args, repl)
-            history = REPLHistory(max_output_chars=self.max_output_chars)
+        # Interpreter calls block, so they run on one dedicated thread (interpreters such as PythonInterpreter
+        # are single-threaded). This keeps the loop free to run async tools, which execution_tools submit to it.
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dspy-rlm-interpreter")
 
-            for iteration in range(self.max_iters):
-                result = await self._aexecute_iteration(
-                    repl, variables, history, iteration, regular_args, output_field_names, interpreter_factory,
-                    sub_agent_rules,
-                )
-                if isinstance(result, Prediction):
-                    return result
-                history = result
+        def run_in_interpreter_thread(fn: Callable[..., Any], *args: Any) -> Awaitable[Any]:
+            return loop.run_in_executor(executor, functools.partial(contextvars.copy_context().run, fn, *args))
 
-            # Max iterations reached - use extract fallback
-            return await self._aextract_fallback(variables, history, output_field_names)
+        try:
+            async with self._ainterpreter_context(execution_tools, interpreter_factory, run_in_interpreter_thread) as repl:
+                sub_agent_rules = await run_in_interpreter_thread(self._setup_facade, repl, budget, interpreter_factory)
+                regular_args = await run_in_interpreter_thread(self._prepare_serializable_vars, input_args, repl)
+                history = REPLHistory(max_output_chars=self.max_output_chars)
+
+                for iteration in range(self.max_iters):
+                    result = await self._aexecute_iteration(
+                        repl, variables, history, iteration, regular_args, output_field_names, interpreter_factory,
+                        sub_agent_rules, run_in_interpreter_thread,
+                    )
+                    if isinstance(result, Prediction):
+                        return result
+                    history = result
+
+                # Max iterations reached - use extract fallback
+                return await self._aextract_fallback(variables, history, output_field_names)
+        finally:
+            # Don't wait: work still queued here may need this loop to finish an async tool.
+            executor.shutdown(wait=False)

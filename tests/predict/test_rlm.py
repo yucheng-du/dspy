@@ -6,11 +6,14 @@ Test organization:
 - Integration tests (@pytest.mark.deno): PythonInterpreter with Deno
 """
 
+import asyncio
 import base64
+import inspect
 import io
 import sys
-from contextlib import contextmanager, redirect_stdout
+from contextlib import asynccontextmanager, contextmanager, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1328,6 +1331,192 @@ class TestRLMAsyncMock:
 
         result = await rlm.aforward(query="test", interpreter_factory=lambda: mock)
         assert result.answer == "done"
+
+
+@asynccontextmanager
+async def mcp_test_session():
+    """Open a client session to the stdio MCP server in tests/utils/resources."""
+    pytest.importorskip("mcp")
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    server = Path(__file__).parents[1] / "utils" / "resources" / "mcp_server.py"
+    server_params = StdioServerParameters(command=sys.executable, args=[str(server)])
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await asyncio.wait_for(session.initialize(), timeout=10)
+            yield session
+
+
+class TestRLMAsyncTools:
+    """Async tools, including MCP tools, called from code executed by RLM (issue #10647)."""
+
+    def test_mcp_tool_exposes_its_declared_parameters(self):
+        from dspy.utils.mcp import convert_mcp_tool
+
+        class UnusedClient:
+            async def call_tool(self, name, arguments=None):
+                raise AssertionError("not called")
+
+        def mcp_tool(name, input_schema):
+            return SimpleNamespace(name=name, description=name, inputSchema=input_schema)
+
+        tools = [
+            convert_mcp_tool(UnusedClient(), mcp_tool("get_user_info", {
+                "type": "object",
+                "properties": {
+                    "verbose": {"type": "boolean", "default": False},
+                    "name": {"type": "string"},
+                },
+                "required": ["name"],
+            })),
+            convert_mcp_tool(UnusedClient(), mcp_tool("ping", {"type": "object", "properties": {}})),
+            convert_mcp_tool(UnusedClient(), mcp_tool("lookup", {
+                "type": "object",
+                "properties": {"user-id": {"type": "string"}},
+            })),
+        ]
+        execution_tools = RLM("query -> answer", tools=tools)._prepare_execution_tools()
+
+        assert str(inspect.signature(execution_tools["get_user_info"])) == "(name, verbose=False)"
+        assert str(inspect.signature(execution_tools["ping"])) == "()"
+        # A name that cannot be a Python parameter keeps the forwarding signature instead of failing.
+        assert str(inspect.signature(execution_tools["lookup"])) == "(*args, **kwargs)"
+
+    @pytest.mark.asyncio
+    async def test_aforward_runs_async_tools_on_the_callers_event_loop(self):
+        from dspy.utils.callback import BaseCallback
+
+        caller_loop = asyncio.get_running_loop()
+        loops = []
+        callback_events = []
+
+        async def lookup(key: str) -> str:
+            loops.append(asyncio.get_running_loop())
+            await asyncio.sleep(0)
+            return key.upper()
+
+        class Recorder(BaseCallback):
+            def on_tool_start(self, call_id, instance, inputs):
+                callback_events.append(("start", inputs))
+
+            def on_tool_end(self, call_id, outputs, exception):
+                callback_events.append(("end", outputs, exception))
+
+        rlm = RLM("query -> answer", max_iters=1, tools=[lookup], interpreter_factory=dspy.LocalInterpreter)
+        rlm.generate_action = make_mock_predictor(
+            [{"reasoning": "Look it up", "code": 'SUBMIT(lookup(key="abc"))'}], async_mode=True
+        )
+
+        with dspy.context(callbacks=[Recorder()]):
+            result = await rlm.acall(query="test")
+
+        assert result.answer == "ABC"
+        assert loops == [caller_loop]
+        assert callback_events == [("start", {"kwargs": {"key": "abc"}}), ("end", "ABC", None)]
+
+    @pytest.mark.asyncio
+    async def test_cancelling_aforward_during_an_async_tool_call_shuts_down_the_interpreter(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        shutdowns = []
+
+        async def wait_for_release() -> str:
+            started.set()
+            await release.wait()
+            return "released"
+
+        class RecordingInterpreter(dspy.LocalInterpreter):
+            def shutdown(self):
+                shutdowns.append(self)
+                super().shutdown()
+
+        rlm = RLM("query -> answer", max_iters=1, tools=[wait_for_release], interpreter_factory=RecordingInterpreter)
+        rlm.generate_action = make_mock_predictor(
+            [{"reasoning": "Wait", "code": "SUBMIT(wait_for_release())"}], async_mode=True
+        )
+
+        task = asyncio.create_task(rlm.acall(query="test"))
+        await asyncio.wait_for(started.wait(), timeout=10)
+        task.cancel()
+        # The loop stays free while the cancelled call cleans up, so the in-flight tool can finish.
+        await asyncio.sleep(0.1)
+        assert not task.done()
+        release.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=10)
+        assert len(shutdowns) == 1
+
+    @pytest.mark.deno
+    @pytest.mark.asyncio
+    async def test_aforward_async_tool_with_python_interpreter(self):
+        from dspy.utils.callback import BaseCallback
+
+        caller_loop = asyncio.get_running_loop()
+        loops = []
+        callback_events = []
+
+        async def lookup(key: str) -> str:
+            loops.append(asyncio.get_running_loop())
+            await asyncio.sleep(0)
+            return key.upper()
+
+        class Recorder(BaseCallback):
+            def on_tool_start(self, call_id, instance, inputs):
+                callback_events.append(("start", inputs))
+
+            def on_tool_end(self, call_id, outputs, exception):
+                callback_events.append(("end", outputs, exception))
+
+        rlm = RLM("query -> answer", max_iters=1, tools=[lookup], interpreter_factory=PythonInterpreter)
+        rlm.generate_action = make_mock_predictor(
+            [{"reasoning": "Look it up", "code": 'SUBMIT(lookup(key="abc"))'}], async_mode=True
+        )
+
+        with dspy.context(callbacks=[Recorder()]):
+            result = await rlm.acall(query="test")
+
+        assert result.answer == "ABC"
+        assert loops == [caller_loop]
+        assert callback_events == [("start", {"kwargs": {"key": "abc"}}), ("end", "ABC", None)]
+
+    @pytest.mark.extra
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "interpreter_factory",
+        [pytest.param(PythonInterpreter, marks=pytest.mark.deno), dspy.LocalInterpreter],
+    )
+    async def test_aforward_calls_tools_of_a_live_mcp_session(self, interpreter_factory):
+        async with mcp_test_session() as session:
+            tools = [Tool.from_mcp_tool(session, tool) for tool in (await session.list_tools()).tools]
+            rlm = RLM("query -> answer: int, name: str", max_iters=2, tools=tools, interpreter_factory=interpreter_factory)
+            rlm.generate_action = make_mock_predictor([
+                {
+                    "reasoning": "Check error reporting and a tool without arguments",
+                    "code": "try:\n    wrong_tool()\nexcept Exception as e:\n    print('caught', e)\nprint(current_datetime())",
+                },
+                {
+                    "reasoning": "Call tools by their declared parameters",
+                    "code": (
+                        "total = add(a=19, b=23)\n"
+                        "name = get_account_name(account={'profile': {'name': 'Ada', 'age': 36}, 'account_id': 'a-1'})\n"
+                        "SUBMIT(answer=total, name=name)"
+                    ),
+                },
+            ], async_mode=True)
+
+            result = await rlm.acall(query="test")
+
+            # The session still serves requests after RLM returns.
+            assert (await session.call_tool("add", arguments={"a": 1, "b": 2})).content[0].text == "3"
+
+        assert result.answer == 42
+        assert result.name == "Ada"
+        assert "caught" in result.trajectory[0]["output"]
+        assert "error!" in result.trajectory[0]["output"]
+        assert "2025-07-23T09:10:10.0+00:00" in result.trajectory[0]["output"]
+        assert len(result.trajectory) == 2
+        assert not result.trajectory[1]["output"].startswith("[Error]")
 
 
 class TestRLMTypeCoercionMock:
