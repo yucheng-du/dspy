@@ -1416,35 +1416,40 @@ class TestRLMAsyncTools:
         assert callback_events == [("start", {"kwargs": {"key": "abc"}}), ("end", "ABC", None)]
 
     @pytest.mark.asyncio
-    async def test_cancelling_aforward_during_an_async_tool_call_shuts_down_the_interpreter(self):
-        started, release = asyncio.Event(), asyncio.Event()
+    async def test_cancelling_aforward_cancels_an_in_flight_async_tool(self):
+        caller_loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        tool_cancelled_on = []
         shutdowns = []
 
-        async def wait_for_release() -> str:
+        async def wait_forever() -> str:
             started.set()
-            await release.wait()
-            return "released"
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                tool_cancelled_on.append(asyncio.get_running_loop())
+                raise
+            return "unreachable"
 
         class RecordingInterpreter(dspy.LocalInterpreter):
             def shutdown(self):
                 shutdowns.append(self)
                 super().shutdown()
 
-        rlm = RLM("query -> answer", max_iters=1, tools=[wait_for_release], interpreter_factory=RecordingInterpreter)
+        rlm = RLM("query -> answer", max_iters=1, tools=[wait_forever], interpreter_factory=RecordingInterpreter)
         rlm.generate_action = make_mock_predictor(
-            [{"reasoning": "Wait", "code": "SUBMIT(wait_for_release())"}], async_mode=True
+            [{"reasoning": "Wait", "code": "SUBMIT(wait_forever())"}], async_mode=True
         )
 
         task = asyncio.create_task(rlm.acall(query="test"))
         await asyncio.wait_for(started.wait(), timeout=10)
         task.cancel()
-        # The loop stays free while the cancelled call cleans up, so the in-flight tool can finish.
-        await asyncio.sleep(0.1)
-        assert not task.done()
-        release.set()
+        # The tool is never released: cancellation alone must unwind the execution and shut down the interpreter.
+        done, _ = await asyncio.wait([task], timeout=10)
 
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=10)
+        assert done == {task}
+        assert task.cancelled()
+        assert tool_cancelled_on == [caller_loop]
         assert len(shutdowns) == 1
 
     @pytest.mark.deno

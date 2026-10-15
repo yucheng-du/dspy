@@ -19,7 +19,7 @@ import keyword
 import logging
 import threading
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Iterator
 
@@ -146,6 +146,46 @@ def _strip_code_fences(code: str) -> str:
         return remainder.strip()
 
     return remainder[:block_end].strip()
+
+
+class _AsyncToolBridge:
+    """Run async tools on the caller's event loop for interpreter code executing on another thread.
+
+    Clients such as MCP sessions are bound to the loop that created them, so their tools cannot run on a
+    fresh one. ``close`` cancels tool calls in flight and fails later ones, so a cancelled ``aforward`` can
+    unwind an execution that is waiting on a tool.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        self._loop = loop
+        self._lock = threading.Lock()
+        self._pending: set[Future] = set()
+        self._closed = False
+
+    def call(self, tool: Tool, kwargs: dict[str, Any]) -> Any:
+        """Run ``tool.acall(**kwargs)`` on the loop and block until it finishes; call off the loop's thread."""
+        with self._lock:
+            if self._closed:
+                raise CancelledError("The RLM call that owns this tool was cancelled.")
+            future = asyncio.run_coroutine_threadsafe(tool.acall(**kwargs), self._loop)
+            self._pending.add(future)
+        try:
+            return future.result()
+        finally:
+            with self._lock:
+                self._pending.discard(future)
+
+    def close(self) -> None:
+        """Cancel tool calls in flight and refuse new ones.
+
+        The interpreter sees an ordinary tool error (``concurrent.futures.CancelledError``), so it answers the
+        sandbox and its execution can end.
+        """
+        with self._lock:
+            self._closed = True
+            pending = list(self._pending)
+        for future in pending:
+            future.cancel()
 
 
 def _interpreter_tool_signature(tool: Tool) -> inspect.Signature:
@@ -630,17 +670,15 @@ class RLM(Module):
     # CodeInterpreter Lifecycle
     # =========================================================================
 
-    def _make_interpreter_tool(self, tool: Tool, loop: asyncio.AbstractEventLoop | None = None) -> Callable:
+    def _make_interpreter_tool(self, tool: Tool, bridge: _AsyncToolBridge | None = None) -> Callable:
         """Preserve function metadata while routing execution through Tool.
 
-        With ``loop``, async tools run on that event loop and the returned callable blocks until they finish;
-        it must then be called off the loop's thread. Clients such as MCP sessions are bound to the loop
-        that created them, so their tools cannot run on a fresh one.
+        With ``bridge``, async tools run through it, and the returned callable blocks until they finish.
         """
         if inspect.iscoroutinefunction(tool.func) or inspect.iscoroutinefunction(getattr(tool.func, "__call__", None)):
-            if loop is not None:
+            if bridge is not None:
                 def invoke(**kwargs):
-                    return asyncio.run_coroutine_threadsafe(tool.acall(**kwargs), loop).result()
+                    return bridge.call(tool, kwargs)
             else:
                 async def invoke(**kwargs):
                     return await tool.acall(**kwargs)
@@ -653,13 +691,13 @@ class RLM(Module):
         return invoke
 
     def _prepare_execution_tools(
-        self, budget: _LLMCallBudget | None = None, loop: asyncio.AbstractEventLoop | None = None
+        self, budget: _LLMCallBudget | None = None, bridge: _AsyncToolBridge | None = None
     ) -> dict[str, Callable]:
         """Create the LLM tools on ``budget`` (fresh by default) and merge with user-provided tools."""
         budget = budget if budget is not None else _LLMCallBudget(self.max_llm_calls)
         execution_tools = self._make_llm_tools(budget)
         execution_tools.update(
-            {name: self._make_interpreter_tool(tool, loop) for name, tool in self._user_tools.items()}
+            {name: self._make_interpreter_tool(tool, bridge) for name, tool in self._user_tools.items()}
         )
         return execution_tools
 
@@ -699,6 +737,7 @@ class RLM(Module):
         execution_tools: dict[str, Callable],
         factory: Callable[[], CodeInterpreter],
         run_in_interpreter_thread: Callable[..., Awaitable[Any]],
+        tool_bridge: _AsyncToolBridge,
     ) -> AsyncIterator[CodeInterpreter]:
         """Async version: shutdown runs on the interpreter thread, after any in-flight execution."""
         _validate_interpreter_factory(factory)
@@ -708,6 +747,9 @@ class RLM(Module):
             self._inject_execution_context(interpreter, execution_tools)
             yield interpreter
         finally:
+            # On cancellation an execution may still be waiting on an async tool; cancel the tool so the
+            # execution can end and the shutdown queued behind it can run.
+            tool_bridge.close()
             # Shielded so that cancelling the caller again does not drop the queued shutdown.
             await asyncio.shield(run_in_interpreter_thread(interpreter.shutdown))
 
@@ -1003,18 +1045,21 @@ class RLM(Module):
         output_field_names = list(self.signature.output_fields.keys())
         budget = _LLMCallBudget(self.max_llm_calls)
         loop = asyncio.get_running_loop()
-        execution_tools = self._prepare_execution_tools(budget, loop)
+        tool_bridge = _AsyncToolBridge(loop)
+        execution_tools = self._prepare_execution_tools(budget, tool_bridge)
         variables = self._build_variables(**input_args)
 
         # Interpreter calls block, so they run on one dedicated thread (interpreters such as PythonInterpreter
-        # are single-threaded). This keeps the loop free to run async tools, which execution_tools submit to it.
+        # are single-threaded). This keeps the loop free to run async tools, which tool_bridge submits to it.
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dspy-rlm-interpreter")
 
         def run_in_interpreter_thread(fn: Callable[..., Any], *args: Any) -> Awaitable[Any]:
             return loop.run_in_executor(executor, functools.partial(contextvars.copy_context().run, fn, *args))
 
         try:
-            async with self._ainterpreter_context(execution_tools, interpreter_factory, run_in_interpreter_thread) as repl:
+            async with self._ainterpreter_context(
+                execution_tools, interpreter_factory, run_in_interpreter_thread, tool_bridge
+            ) as repl:
                 sub_agent_rules = await run_in_interpreter_thread(self._setup_facade, repl, budget, interpreter_factory)
                 regular_args = await run_in_interpreter_thread(self._prepare_serializable_vars, input_args, repl)
                 history = REPLHistory(max_output_chars=self.max_output_chars)
