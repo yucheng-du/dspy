@@ -708,7 +708,8 @@ class RLM(Module):
             self._inject_execution_context(interpreter, execution_tools)
             yield interpreter
         finally:
-            await run_in_interpreter_thread(interpreter.shutdown)
+            # Shielded so that cancelling the caller again does not drop the queued shutdown.
+            await asyncio.shield(run_in_interpreter_thread(interpreter.shutdown))
 
     # =========================================================================
     # Execution Core
