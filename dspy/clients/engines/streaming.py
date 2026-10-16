@@ -13,9 +13,10 @@ class EngineChunk(AttributeDict):
 
 
 class ListenerBridge:
-    def __init__(self, model, predict_id=None):
+    def __init__(self, model, predict_id=None, predict_call_id=None):
         self.model = model
         self.predict_id = predict_id
+        self.predict_call_id = predict_call_id
         self.id = None
         self.tools = {}
 
@@ -59,4 +60,5 @@ class ListenerBridge:
             return None
         delta.setdefault("content", None)
         return EngineChunk(id=self.id, model=self.model, predict_id=self.predict_id,
+                           predict_call_id=self.predict_call_id,
                            choices=[attributes({"index": 0, "delta": delta, "finish_reason": finish})])

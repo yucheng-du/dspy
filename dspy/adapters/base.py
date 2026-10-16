@@ -252,7 +252,9 @@ class Adapter:
         if settings.send_stream and settings.stream_listeners:
             from dspy.streaming.messages import _StreamSignature, sync_send_to_stream
 
-            sync_send_to_stream(settings.send_stream, _StreamSignature(id(settings.caller_predict), processed_signature))
+            sync_send_to_stream(settings.send_stream, _StreamSignature(
+                id(settings.caller_predict), processed_signature, settings.caller_predict_call_id,
+            ))
         # TODO(3.5): build Request and parse Response directly; remove this marker.
         with adapter_message_call(lm, messages):
             outputs = lm(messages=messages, **lm_kwargs)
@@ -274,7 +276,9 @@ class Adapter:
         if settings.send_stream and settings.stream_listeners:
             from dspy.streaming.messages import _StreamSignature
 
-            await settings.send_stream.send(_StreamSignature(id(settings.caller_predict), processed_signature))
+            await settings.send_stream.send(_StreamSignature(
+                id(settings.caller_predict), processed_signature, settings.caller_predict_call_id,
+            ))
         # TODO(3.5): share the canonical request/response boundary with __call__.
         with adapter_message_call(lm, messages):
             outputs = await lm.acall(messages=messages, **lm_kwargs)

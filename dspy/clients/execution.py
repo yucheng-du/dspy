@@ -37,9 +37,6 @@ from dspy.lm15 import (
     request_from_openai_chat,
 )
 from dspy.utils.exceptions import LMConfigurationError, LMUnsupportedFeatureError, is_retryable_lm_error
-from dspy.utils.lazy_import import require
-
-anyio = require("anyio")
 
 IGNORED_CACHE_KEYS = ["api_key", "api_base", "base_url"]
 
@@ -592,7 +589,8 @@ def _attempt(lm, call, backend, request, provider, state, results):
         _accept_response(lm, call, state, results, response, provider, request)
     else:
         accumulator = StreamAccumulator(request)
-        bridge = ListenerBridge(lm.model, id(settings.caller_predict) if settings.caller_predict else None)
+        bridge = ListenerBridge(lm.model, id(settings.caller_predict) if settings.caller_predict else None,
+                                settings.caller_predict_call_id)
         events = checked_stream(backend.stream(request), provider=provider)
         try:
             with closing_stream(events):
@@ -603,7 +601,9 @@ def _attempt(lm, call, backend, request, provider, state, results):
                     if chunk := bridge.chunk(event):
                         state.emitted = True
                         stream_emitted()
-                        anyio.from_thread.run(stream.send, chunk)
+                        from dspy.streaming.messages import sync_send_to_stream
+
+                        sync_send_to_stream(stream, chunk)
         except StreamAssemblyError as exc:
             if exc.partial is None:
                 exc.partial = _partial(accumulator)
@@ -671,7 +671,8 @@ async def _aattempt(lm, call, backend, request, provider, state, results):
         _accept_response(lm, call, state, results, response, provider, request)
     else:
         accumulator = StreamAccumulator(request)
-        bridge = ListenerBridge(lm.model, id(settings.caller_predict) if settings.caller_predict else None)
+        bridge = ListenerBridge(lm.model, id(settings.caller_predict) if settings.caller_predict else None,
+                                settings.caller_predict_call_id)
         events = achecked_stream(backend.stream(request), provider=provider)
         try:
             async with aclosing_stream(events):

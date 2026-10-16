@@ -3,6 +3,7 @@ import contextvars
 import logging
 import threading
 from asyncio import iscoroutinefunction
+from contextlib import aclosing
 from queue import Queue
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable, Generator
 
@@ -50,6 +51,35 @@ def _single_failure(exc: BaseException) -> BaseException | None:
         else:
             pending.extend(children)
     return leaves[0] if len(leaves) == 1 else None
+
+
+class _CallListeners:
+    """Parser instances owned by one streamed run, rather than a predictor object."""
+
+    def __init__(self, templates):
+        self.templates = templates
+        self.instances = {}
+        self.selected = {}
+
+    def for_call(self, predict_id, call_id, *, chunk=False):
+        for template in self.templates.get(predict_id, []):
+            identity = id(template)
+            if chunk and not template.allow_reuse:
+                # Keep the existing one-stream behavior. A cached call with no
+                # chunks must not claim the listener before a real stream starts.
+                selected = self.selected.setdefault(identity, call_id)
+                if selected != call_id:
+                    continue
+            key = (identity, call_id)
+            if key not in self.instances:
+                self.instances[key] = template._fork()
+            yield self.instances[key]
+
+    def finish(self):
+        for (_, call_id), listener in self.instances.items():
+            if output := listener.finalize():
+                output.predict_call_id = call_id
+                yield output
 
 
 def streamify(
@@ -194,16 +224,19 @@ def streamify(
     if not any(isinstance(c, StatusStreamingCallback) for c in callbacks):
         callbacks.append(status_streaming_callback)
 
-    async def generator(args, kwargs, stream: "MemoryObjectSendStream"):
-        with settings.context(send_stream=stream, callbacks=callbacks, stream_listeners=stream_listeners):
+    async def generator(args, kwargs, stream: "MemoryObjectSendStream", portal):
+        with settings.context(send_stream=stream, stream_portal=portal,
+                              stream_owner_thread_id=threading.get_ident(),
+                              callbacks=callbacks, stream_listeners=stream_listeners):
             prediction = await program(*args, **kwargs)
 
         await stream.send(prediction)
 
     async def async_streamer(*args, **kwargs):
         try:
-            async for value in _stream_program(args, kwargs):
-                yield value
+            async with aclosing(_stream_program(args, kwargs)) as output:
+                async for value in output:
+                    yield value
         except BaseException as exc:
             # The task group reports failures as an exception group. One
             # failure is the program's own exception; callers wrote
@@ -214,48 +247,48 @@ def streamify(
             raise leaf from None
 
     async def _stream_program(args, kwargs):
+        listeners = _CallListeners(predict_id_to_listener)
         send_stream, receive_stream = anyio.create_memory_object_stream(16)
-        async with anyio.create_task_group() as tg, send_stream, receive_stream:
-            tg.start_soon(generator, args, kwargs, send_stream)
+        async with anyio.from_thread.BlockingPortal() as portal:
+            try:
+                async with send_stream, receive_stream, anyio.create_task_group() as tg:
+                    tg.start_soon(generator, args, kwargs, send_stream, portal)
 
-            async for value in receive_stream:
-                if isinstance(value, _StreamSignature):
-                    for listener in predict_id_to_listener.get(value.predict_id, []):
-                        listener._set_signature(value.signature)
-                elif _is_litellm_model_response_stream(value):
-                    if len(predict_id_to_listener) == 0:
-                        # No listeners are configured, yield the chunk directly for backwards compatibility.
-                        yield value
-                    else:
-                        # We are receiving a chunk from the LM's response stream, delegate it to the listeners to
-                        # determine if we should yield a value to the user.
-                        for listener in predict_id_to_listener[value.predict_id]:
-                            # In some special cases such as Citation API, it is possible that multiple listeners
-                            # return values at the same time due to the chunk buffer of the listener.
-                            if output := listener.receive(value):
+                    async for value in receive_stream:
+                        if isinstance(value, _StreamSignature):
+                            for listener in listeners.for_call(value.predict_id, value.predict_call_id):
+                                listener._set_signature(value.signature)
+                        elif _is_litellm_model_response_stream(value):
+                            if len(predict_id_to_listener) == 0:
+                                # No listeners: preserve raw chunk delivery.
+                                yield value
+                            else:
+                                call_id = getattr(value, "predict_call_id", None)
+                                for listener in listeners.for_call(value.predict_id, call_id, chunk=True):
+                                    if output := listener.receive(value):
+                                        output.predict_call_id = call_id
+                                        yield output
+                        elif isinstance(value, StatusMessage):
+                            yield value
+                        elif isinstance(value, Prediction):
+                            for output in listeners.finish():
                                 yield output
-                elif isinstance(value, StatusMessage):
-                    yield value
-                elif isinstance(value, Prediction):
-                    # Flush remaining buffered tokens before yielding the Prediction instance
-                    for listener in stream_listeners:
-                        if final_chunk := listener.finalize():
-                            yield final_chunk
-
-                    if include_final_prediction_in_output_stream:
-                        yield value
-                    elif (
-                        len(stream_listeners) == 0
-                        or any(listener.cache_hit for listener in stream_listeners)
-                        or not any(listener.stream_start for listener in stream_listeners)
-                    ):
-                        yield value
-                    return
-                else:
-                    # This wildcard case allows for customized streaming behavior.
-                    # It is useful when a users have a custom LM which returns stream chunks in a custom format.
-                    # We let those chunks pass through to the user to handle them as needed.
-                    yield value
+                            active = listeners.instances.values()
+                            if (
+                                include_final_prediction_in_output_stream
+                                or not stream_listeners
+                                or any(listener.cache_hit for listener in active)
+                                or not any(listener.stream_start for listener in active)
+                            ):
+                                yield value
+                            return
+                        else:
+                            # Customized LM chunks still pass through unchanged.
+                            yield value
+            finally:
+                # asyncify abandons a cancelled worker; release its pending sends
+                # and legacy stream tasks, and reject any later portal calls.
+                await portal.stop(cancel_remaining=True)
 
     if async_streaming:
         return async_streamer

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import inspect
 import re
 from collections import defaultdict
@@ -42,8 +43,8 @@ class StreamListener:
                 the predictor that has the `signature_field_name` in its signature.
             predict_name: The name of the predictor to listen to. If None, when calling `streamify()` it will
                 automatically look for the predictor that has the `signature_field_name` in its signature.
-            allow_reuse: If True, the stream listener can be reused for multiple streams. Please note that this could
-                hurt the performance because the same stream chunk is sent to multiple listeners.
+            allow_reuse: If True, listen to every call of the predictor with separate parser state.
+                If False, listen only to the first call that produces chunks in each streamed run.
         """
         self.signature_field_name = signature_field_name
         self._wire_field_name = signature_field_name
@@ -85,6 +86,27 @@ class StreamListener:
                 "end_pattern_contains": "</",  # Any closing tag start
             },
         }
+
+    def _fork(self):
+        """Copy configuration and subclass behavior, with fresh base parser state.
+
+        Like copy.copy(), this honors a subclass's __copy__ for any additional
+        mutable state it owns. Never copy the predictor, LM or their resources.
+        Adapter markers are mutable too: _set_signature changes nested entries.
+        """
+        listener = copy.copy(self)
+        listener.adapter_identifiers = copy.deepcopy(self.adapter_identifiers)
+        listener._wire_field_name = self.signature_field_name
+        listener._use_native_reasoning = True
+        listener.field_start_queue = []
+        listener.field_end_queue = Queue()
+        listener.stream_start = False
+        listener.stream_end = False
+        listener.cache_hit = False
+        listener.json_adapter_state = {"field_accumulated_messages": ""}
+        listener.value_started = False
+        listener.held_whitespace = ""
+        return listener
 
     def _buffered_message_end_with_start_identifier(self, concat_message: str, start_identifier: str) -> str:
         for i in range(len(concat_message)):
