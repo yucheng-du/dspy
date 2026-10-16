@@ -657,6 +657,8 @@ def _get_stream_completion_fn(
     # The stream is already opened, and will be closed by the caller.
     stream = cast("MemoryObjectSendStream", stream)
     caller_predict_id = id(caller_predict) if caller_predict else None
+    predict_call_id = dspy.settings.caller_predict_call_id
+    stream_portal = dspy.settings.stream_portal
 
     if dspy.settings.track_usage:
         request["stream_options"] = {"include_usage": True}
@@ -674,6 +676,7 @@ def _get_stream_completion_fn(
             async for chunk in response:
                 if caller_predict_id:
                     chunk.predict_id = caller_predict_id
+                    chunk.predict_call_id = predict_call_id
                 chunks.append(chunk)
                 stream_emitted()
                 await stream.send(chunk)
@@ -682,6 +685,8 @@ def _get_stream_completion_fn(
             return raw
 
     def sync_stream_completion():
+        if stream_portal is not None:
+            return stream_portal.call(stream_completion, request, cache_kwargs)
         return anyio.from_thread.run(functools.partial(stream_completion, request, cache_kwargs))
 
     async def async_stream_completion():

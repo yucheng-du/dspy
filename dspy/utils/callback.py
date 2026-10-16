@@ -320,10 +320,15 @@ def with_callbacks(fn):
             try:
                 _get_on_start_handler(callback, instance, fn)(call_id=call_id, instance=instance, inputs=inputs)
             except Exception as e:
+                from dspy.streaming.messages import StatusStreamingCallback, _StreamDeliveryError
+
+                if isinstance(callback, StatusStreamingCallback) and isinstance(e, _StreamDeliveryError):
+                    raise
                 logger.warning(f"Error when calling callback {callback}: {e}")
 
     def _execute_end_callbacks(instance, fn, call_id, results, exception, callbacks):
         """Execute all end callbacks for a function call."""
+        delivery_error = None
         for callback in callbacks:
             try:
                 _get_on_end_handler(callback, instance, fn)(
@@ -332,11 +337,55 @@ def with_callbacks(fn):
                     exception=exception,
                 )
             except Exception as e:
+                from dspy.streaming.messages import StatusStreamingCallback, _StreamDeliveryError
+
+                if isinstance(callback, StatusStreamingCallback) and isinstance(e, _StreamDeliveryError):
+                    delivery_error = delivery_error or e
+                    continue
                 logger.warning(f"Error when applying callback {callback}'s end handler on function {fn.__name__}: {e}.")
+        if delivery_error is not None and exception is None:
+            raise delivery_error
 
     def _get_active_callbacks(instance):
         """Get combined global and instance-level callbacks."""
         return dspy.settings.get("callbacks", []) + getattr(instance, "callbacks", [])
+
+    async def _execute_async_callbacks(instance, call_id, callbacks, *, inputs=None, results=None, exception=None):
+        # Only built-in status handlers have an internal await hook. User
+        # callbacks retain synchronous dispatch and the existing warning policy.
+        from dspy.streaming.messages import StatusStreamingCallback, _StreamDeliveryError
+
+        delivery_error = None
+        for callback in callbacks:
+            kwargs = {"call_id": call_id, "instance": instance, "inputs": inputs} if inputs is not None else {
+                "call_id": call_id, "outputs": results, "exception": exception,
+            }
+            try:
+                handler = (_get_on_start_handler if inputs is not None else _get_on_end_handler)(callback, instance, fn)
+                internal_status = isinstance(callback, StatusStreamingCallback) and (
+                    getattr(handler, "__func__", None) is getattr(StatusStreamingCallback, handler.__name__, None)
+                )
+                if not internal_status:
+                    handler(**kwargs)
+                    continue
+            except Exception as e:
+                if isinstance(callback, StatusStreamingCallback) and isinstance(e, _StreamDeliveryError):
+                    if inputs is not None:
+                        raise
+                    delivery_error = delivery_error or e
+                    continue
+                logger.warning(f"Error when applying callback {callback} on function {fn.__name__}: {e}.")
+                continue
+            try:
+                await callback._acall(handler.__name__, **kwargs)
+            except BaseException as exc:
+                if inputs is not None:
+                    raise
+                # End-status cancellation must not skip subsequent synchronous
+                # user cleanup callbacks, or replace the program's own failure.
+                delivery_error = delivery_error or exc
+        if delivery_error is not None and exception is None:
+            raise delivery_error
 
     if inspect.iscoroutinefunction(fn):
 
@@ -348,7 +397,10 @@ def with_callbacks(fn):
 
             call_id = uuid.uuid4().hex
 
-            _execute_start_callbacks(instance, fn, call_id, callbacks, args, kwargs)
+            inputs = inspect.getcallargs(fn, instance, *args, **kwargs)
+            inputs.pop("self", None)
+            inputs.pop("instance", None)
+            await _execute_async_callbacks(instance, call_id, callbacks, inputs=inputs)
 
             # Active ID must be set right before the function is called, not before calling the callbacks.
             parent_call_id = callback_context.ACTIVE_CALL_ID.get()
@@ -364,7 +416,7 @@ def with_callbacks(fn):
                 raise
             finally:
                 callback_context.ACTIVE_CALL_ID.set(parent_call_id)
-                _execute_end_callbacks(instance, fn, call_id, results, exception, callbacks)
+                await _execute_async_callbacks(instance, call_id, callbacks, results=results, exception=exception)
 
         return async_wrapper
 

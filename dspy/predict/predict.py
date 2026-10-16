@@ -18,6 +18,7 @@ from dspy.primitives.module import Module
 from dspy.primitives.prediction import Prediction
 from dspy.signatures.signature import Signature, ensure_signature
 from dspy.utils.callback import BaseCallback
+from dspy.utils.callback_context import ACTIVE_CALL_ID
 from dspy.utils.constants import IS_TYPE_UNDEFINED
 
 logger = logging.getLogger(__name__)
@@ -266,7 +267,11 @@ class Predict(Module, Parameter):
         adapter = resolve_adapter(lm, settings.adapter or ChatAdapter(), signature, self.fields, self.signature)
 
         if self._should_stream():
-            with settings.context(caller_predict=self):
+            from dspy.streaming.messages import _PredictStream
+
+            call_id = ACTIVE_CALL_ID.get()
+            with settings.context(caller_predict=self, caller_predict_call_id=call_id,
+                                  send_stream=_PredictStream(settings.send_stream, id(self), call_id)):
                 completions = adapter(lm, lm_kwargs=config, signature=signature, demos=demos, inputs=kwargs)
         else:
             with settings.context(send_stream=None):
@@ -279,7 +284,11 @@ class Predict(Module, Parameter):
 
         adapter = resolve_adapter(lm, settings.adapter or ChatAdapter(), signature, self.fields, self.signature)
         if self._should_stream():
-            with settings.context(caller_predict=self):
+            from dspy.streaming.messages import _PredictStream
+
+            call_id = ACTIVE_CALL_ID.get()
+            with settings.context(caller_predict=self, caller_predict_call_id=call_id,
+                                  send_stream=_PredictStream(settings.send_stream, id(self), call_id)):
                 completions = await adapter.acall(lm, lm_kwargs=config, signature=signature, demos=demos, inputs=kwargs)
         else:
             with settings.context(send_stream=None):
