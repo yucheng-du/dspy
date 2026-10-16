@@ -697,3 +697,97 @@ async def test_distinct_predictors_and_raw_engine_chunks_keep_their_routes(liste
         else:
             assert "".join(item.choices[0].delta.content or "" for item in chunks) == HEADER + ANSWERS[name] + END
             assert sum(item.choices[0].finish_reason == "stop" for item in chunks) == 1
+
+
+@pytest.mark.anyio
+async def test_cancelled_start_status_cleans_up_only_callbacks_that_started():
+    from contextlib import aclosing
+
+    from dspy.streaming.messages import StatusStreamingCallback
+    from dspy.utils.callback import ACTIVE_CALL_ID
+
+    class StartOnly(CountingStatuses):
+        def tool_end_status_message(self, outputs):
+            return None
+
+    provider = StartOnly()
+    trace, later_trace = EndTrace(), EndTrace()
+    module = ToolProgram(30)
+    ready, hold = asyncio.Event(), asyncio.Event()
+    ended_parents, program_ids = [], []
+
+    class ParentTrace(BaseCallback):
+        def on_module_start(self, call_id, instance, inputs):
+            if instance is module:
+                program_ids.append(call_id)
+
+        def on_tool_end(self, call_id, outputs, exception):
+            if exception is not None:
+                ended_parents.append(ACTIVE_CALL_ID.get())
+                # Cleanup failure must not replace the original cancellation.
+                raise RuntimeError("cleanup failed after start cancellation")
+
+    async def consume(stream):
+        token = ACTIVE_CALL_ID.set("outside")
+        try:
+            async with aclosing(stream()) as output:
+                async for _ in output:
+                    ready.set()
+                    await hold.wait()
+        finally:
+            assert ACTIVE_CALL_ID.get() == "outside"
+            ACTIVE_CALL_ID.reset(token)
+
+    # The trace precedes status, as in streamify's normal automatic callback
+    # installation. A later trace also checks that an unstarted callback does
+    # not receive a fabricated end notification for the cancelled call.
+    with dspy.context(callbacks=[trace, ParentTrace(), StatusStreamingCallback(provider), later_trace]):
+        stream = dspy.streamify(module, is_async_program=True)
+        with anyio.fail_after(10):
+            task = asyncio.create_task(consume(stream))
+            try:
+                await ready.wait()
+                await provider.blocked_end.wait()
+                await anyio.sleep(0)
+                assert provider.produced == 18
+                assert provider.stream.statistics().current_buffer_used == 16
+                assert provider.stream.statistics().tasks_waiting_send == 1
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+    assert module.cleaned
+    assert len(trace.starts) == len(trace.ends) == 18
+    assert set(trace.starts) == {call_id for call_id, _ in trace.ends}
+    assert isinstance(trace.ends[-1][1], asyncio.CancelledError)
+    assert len(later_trace.starts) == len(later_trace.ends) == 17
+    assert set(later_trace.starts) == {call_id for call_id, _ in later_trace.ends}
+    assert len(ended_parents) == 1 and ended_parents == program_ids
+    assert trace.module_end_parents == ["outside"]
+
+
+@pytest.mark.anyio
+async def test_async_callback_inputs_preserve_a_user_parameter_named_instance():
+    from dspy.utils.callback import with_callbacks
+
+    captured = []
+
+    class Trace(BaseCallback):
+        def on_module_start(self, call_id, instance, inputs):
+            captured.append(inputs)
+
+    class Operation:
+        @with_callbacks
+        async def run(self, instance):
+            return instance
+
+    payload = object()
+    with dspy.context(callbacks=[Trace()]):
+        assert await Operation().run(payload) is payload
+    assert captured == [{"instance": payload}]

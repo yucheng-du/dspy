@@ -356,6 +356,7 @@ def with_callbacks(fn):
         from dspy.streaming.messages import StatusStreamingCallback, _StreamDeliveryError
 
         delivery_error = None
+        started_callbacks = []
         for callback in callbacks:
             kwargs = {"call_id": call_id, "instance": instance, "inputs": inputs} if inputs is not None else {
                 "call_id": call_id, "outputs": results, "exception": exception,
@@ -366,6 +367,8 @@ def with_callbacks(fn):
                     getattr(handler, "__func__", None) is getattr(StatusStreamingCallback, handler.__name__, None)
                 )
                 if not internal_status:
+                    if inputs is not None:
+                        started_callbacks.append(callback)
                     handler(**kwargs)
                     continue
             except Exception as e:
@@ -378,8 +381,19 @@ def with_callbacks(fn):
                 continue
             try:
                 await callback._acall(handler.__name__, **kwargs)
+                if inputs is not None:
+                    started_callbacks.append(callback)
             except BaseException as exc:
                 if inputs is not None:
+                    # The body has not started, but earlier user callbacks may
+                    # already own resources. Run only their matching cleanup.
+                    # This path is synchronous: a cancelled/full status stream
+                    # must not introduce another blocking await during cleanup.
+                    for started in started_callbacks:
+                        try:
+                            _execute_end_callbacks(instance, fn, call_id, None, exc, [started])
+                        except BaseException as cleanup_error:
+                            logger.warning(f"Error when cleaning up callback {started}: {cleanup_error}")
                     raise
                 # End-status cancellation must not skip subsequent synchronous
                 # user cleanup callbacks, or replace the program's own failure.
@@ -398,8 +412,10 @@ def with_callbacks(fn):
             call_id = uuid.uuid4().hex
 
             inputs = inspect.getcallargs(fn, instance, *args, **kwargs)
-            inputs.pop("self", None)
-            inputs.pop("instance", None)
+            if "self" in inputs:
+                inputs.pop("self")
+            elif "instance" in inputs:
+                inputs.pop("instance")
             await _execute_async_callbacks(instance, call_id, callbacks, inputs=inputs)
 
             # Active ID must be set right before the function is called, not before calling the callbacks.
