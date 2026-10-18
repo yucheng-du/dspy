@@ -345,6 +345,40 @@ async def test_inline_sync_tool_on_owner_loop_has_bounded_delivery_and_cleanup(c
     assert set(trace.starts) == {call_id for call_id, _ in trace.ends}
 
 
+@pytest.mark.anyio
+async def test_inline_sync_tool_start_overflow_cleans_up_callbacks_that_started():
+    from dspy.utils.callback import ACTIVE_CALL_ID
+
+    trace = EndTrace()
+    module = ToolProgram(30, inline=True)
+    ended_parents, program_ids = [], []
+
+    class ParentTrace(BaseCallback):
+        def on_module_start(self, call_id, instance, inputs):
+            if instance is module:
+                program_ids.append(call_id)
+
+        def on_tool_end(self, call_id, outputs, exception):
+            if exception is not None:
+                ended_parents.append(ACTIVE_CALL_ID.get())
+                # Cleanup failure must not skip later cleanup or replace the delivery error.
+                raise RuntimeError("cleanup failed after start delivery error")
+
+    # streamify appends its status callback after user callbacks, so the user
+    # starts run before the status start that overflows the buffer.
+    with dspy.context(callbacks=[ParentTrace(), trace]):
+        stream = dspy.streamify(module, is_async_program=True)
+    with anyio.fail_after(10):
+        with pytest.raises(RuntimeError, match="streaming event loop filled its buffer") as error:
+            _ = [value async for value in stream()]
+    assert module.cleaned
+    # Eight tools fill the 16-message buffer; the ninth fails before its body runs.
+    assert len(trace.starts) == len(trace.ends) == 9
+    assert set(trace.starts) == {call_id for call_id, _ in trace.ends}
+    assert trace.ends[-1][1] is error.value
+    assert len(ended_parents) == 1 and ended_parents == program_ids
+
+
 class CountingStatuses(StatusMessageProvider):
     def __init__(self):
         self.produced = 0
