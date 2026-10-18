@@ -316,6 +316,7 @@ def with_callbacks(fn):
             inputs.pop("self")
         elif "instance" in inputs:
             inputs.pop("instance")
+        started_callbacks = []
         for callback in callbacks:
             try:
                 _get_on_start_handler(callback, instance, fn)(call_id=call_id, instance=instance, inputs=inputs)
@@ -323,8 +324,13 @@ def with_callbacks(fn):
                 from dspy.streaming.messages import StatusStreamingCallback, _StreamDeliveryError
 
                 if isinstance(callback, StatusStreamingCallback) and isinstance(e, _StreamDeliveryError):
+                    # The body will not run, but earlier callbacks may already
+                    # own resources. Run only their matching end handlers, as
+                    # the async path does, then raise the delivery error.
+                    _execute_end_callbacks(instance, fn, call_id, None, e, started_callbacks)
                     raise
                 logger.warning(f"Error when calling callback {callback}: {e}")
+            started_callbacks.append(callback)
 
     def _execute_end_callbacks(instance, fn, call_id, results, exception, callbacks):
         """Execute all end callbacks for a function call."""
