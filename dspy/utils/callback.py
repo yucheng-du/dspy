@@ -364,9 +364,15 @@ def with_callbacks(fn):
         delivery_error = None
         started_callbacks = []
         for callback in callbacks:
-            kwargs = {"call_id": call_id, "instance": instance, "inputs": inputs} if inputs is not None else {
-                "call_id": call_id, "outputs": results, "exception": exception,
-            }
+            kwargs = (
+                {"call_id": call_id, "instance": instance, "inputs": inputs}
+                if inputs is not None
+                else {
+                    "call_id": call_id,
+                    "outputs": results,
+                    "exception": exception,
+                }
+            )
             try:
                 handler = (_get_on_start_handler if inputs is not None else _get_on_end_handler)(callback, instance, fn)
                 internal_status = isinstance(callback, StatusStreamingCallback) and (

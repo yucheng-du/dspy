@@ -225,9 +225,13 @@ def streamify(
         callbacks.append(status_streaming_callback)
 
     async def generator(args, kwargs, stream: "MemoryObjectSendStream", portal):
-        with settings.context(send_stream=stream, stream_portal=portal,
-                              stream_owner_thread_id=threading.get_ident(),
-                              callbacks=callbacks, stream_listeners=stream_listeners):
+        with settings.context(
+            send_stream=stream,
+            stream_portal=portal,
+            stream_owner_thread_id=threading.get_ident(),
+            callbacks=callbacks,
+            stream_listeners=stream_listeners,
+        ):
             prediction = await program(*args, **kwargs)
 
         await stream.send(prediction)
